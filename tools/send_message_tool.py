@@ -11,6 +11,7 @@ import os
 import re
 import ssl
 import time
+from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,7 @@ def _handle_send(args):
         "wecom": Platform.WECOM,
         "email": Platform.EMAIL,
         "sms": Platform.SMS,
+        "pushover": Platform.PUSHOVER,
     }
     platform = platform_map.get(platform_name)
     if not platform:
@@ -150,16 +152,20 @@ def _handle_send(args):
 
     used_home_channel = False
     if not chat_id:
-        home = config.get_home_channel(platform)
-        if home:
-            chat_id = home.chat_id
-            used_home_channel = True
+        # Pushover: no home channel needed — use PUSHOVER_USER_KEY from config
+        if platform == Platform.PUSHOVER and pconfig.token:
+            chat_id = pconfig.token
         else:
-            return json.dumps({
-                "error": f"No home channel set for {platform_name} to determine where to send the message. "
-                f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
-                f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
-            })
+            home = config.get_home_channel(platform)
+            if home:
+                chat_id = home.chat_id
+                used_home_channel = True
+            else:
+                return json.dumps({
+                    "error": f"No home channel set for {platform_name} to determine where to send the message. "
+                    f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
+                    f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
+                })
 
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
@@ -301,6 +307,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH,
         Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
+        Platform.PUSHOVER: 1024,
     }
     if _feishu_available:
         _MAX_LENGTHS[Platform.FEISHU] = FeishuAdapter.MAX_MESSAGE_LENGTH
@@ -371,6 +378,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_feishu(pconfig, chat_id, chunk, thread_id=thread_id)
         elif platform == Platform.WECOM:
             result = await _send_wecom(pconfig.extra, chat_id, chunk)
+        elif platform == Platform.PUSHOVER:
+            result = await _send_pushover(pconfig.api_key, pconfig.token, chunk)
         else:
             result = {"error": f"Direct sending not yet implemented for {platform.value}"}
 
@@ -879,6 +888,37 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         }
     except Exception as e:
         return {"error": f"Feishu send failed: {e}"}
+
+async def _send_pushover(token: str, user_key: str, message: str) -> Dict[str, Any]:
+    """Send a Pushover notification.
+
+    token=PUSHOV...OKEN (app token from pushover.net)
+    user_key = PUSHOVER_USER_KEY (the user's/group's key)
+    Chunking is handled by _send_to_platform() before this is called.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    PUSHOVER_API = "https://api.pushover.net/1/messages.json"
+    payload = {
+        "token": token,
+        "user": user_key,
+        "message": message,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(PUSHOVER_API, data=payload) as resp:
+                result = await resp.json()
+                if resp.status == 200 and result.get("status") == 1:
+                    return {"success": True, "platform": "pushover", "message_id": result.get("request")}
+                else:
+                    error_msg = result.get("errors", [result.get("message", "Unknown error")])[0]
+                    return {"error": f"Pushover API error: {error_msg}"}
+    except Exception as e:
+        return {"error": f"Pushover send failed: {e}"}
+>>>>>>> 6745ade0 (feat: add Pushover platform integration)
 
 
 def _check_send_message():

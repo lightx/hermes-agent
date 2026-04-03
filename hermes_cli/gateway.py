@@ -1373,6 +1373,27 @@ _PLATFORMS = [
         ],
     },
     {
+        "key": "pushover",
+        "label": "Pushover",
+        "emoji": "🔔",
+        "token_var": "PUSHOVER_APP_TOKEN",
+        "setup_instructions": [
+            "1. Log in at https://pushover.net",
+            "2. Your User Key is on the front page — copy it",
+            "3. Create an app at https://pushover.net/apps → Create New Application",
+            "4. Copy the API Token (APP_TOKEN) for your new app",
+        ],
+        "vars": [
+            {"name": "PUSHOVER_APP_TOKEN", "prompt": "Pushover App Token", "password": False,
+             "help": "The API Token from your Pushover app (pushover.net/apps)."},
+            {"name": "PUSHOVER_USER_KEY", "prompt": "Pushover User Key", "password": False,
+             "help": "Your Pushover User Key (shown on pushover.net front page)."},
+            {"name": "PUSHOVER_ALLOWED_USERS", "prompt": "Allowed users (comma-separated, or empty for any)", "password": False,
+             "is_allowlist": True,
+             "help": "Only messages from these Pushover user keys will be processed."},
+        ],
+    },
+    {
         "key": "dingtalk",
         "label": "DingTalk",
         "emoji": "💬",

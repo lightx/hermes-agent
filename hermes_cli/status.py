@@ -284,6 +284,7 @@ def show_status(args):
         "DingTalk": ("DINGTALK_CLIENT_ID", None),
         "Feishu": ("FEISHU_APP_ID", "FEISHU_HOME_CHANNEL"),
         "WeCom": ("WECOM_BOT_ID", "WECOM_HOME_CHANNEL"),
+        "Pushover": ("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY"),
     }
     
     for name, (token_var, home_var) in platforms.items():

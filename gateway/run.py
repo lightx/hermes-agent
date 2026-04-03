@@ -1465,6 +1465,28 @@ class GatewayRunner:
                 self.config.group_sessions_per_user,
             )
 
+        # Give plugins a chance to provide the adapter first
+        try:
+            from hermes_cli.plugins import get_plugin_manager
+            callbacks = get_plugin_manager()._hooks.get("on_platform_adapter", [])
+            for cb in callbacks:
+                try:
+                    adapter = cb(platform=platform, config=config)
+                    if adapter is not None:
+                        logger.debug(
+                            "Platform adapter for %s provided by plugin",
+                            platform.value,
+                        )
+                        return adapter
+                except Exception as e:
+                    logger.warning(
+                        "on_platform_adapter hook %s raised: %s",
+                        getattr(cb, "__name__", repr(cb)),
+                        e,
+                    )
+        except ImportError:
+            pass  # Plugin system not available
+
         if platform == Platform.TELEGRAM:
             from gateway.platforms.telegram import TelegramAdapter, check_telegram_requirements
             if not check_telegram_requirements():
@@ -1542,6 +1564,13 @@ class GatewayRunner:
                 return None
             return WeComAdapter(config)
 
+        elif platform == Platform.PUSHOVER:
+            from gateway.platforms.pushover import PushoverAdapter, check_pushover_requirements
+            if not check_pushover_requirements():
+                logger.warning("Pushover: PUSHOVER_APP_TOKEN or PUSHOVER_USER_KEY not set")
+                return None
+            return PushoverAdapter(config)
+
         elif platform == Platform.MATTERMOST:
             from gateway.platforms.mattermost import MattermostAdapter, check_mattermost_requirements
             if not check_mattermost_requirements():
@@ -1610,6 +1639,8 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOWED_USERS",
             Platform.FEISHU: "FEISHU_ALLOWED_USERS",
             Platform.WECOM: "WECOM_ALLOWED_USERS",
+            Platform.PUSHOVER: "PUSHOVER_ALLOWED_USERS",
+        }
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -1624,6 +1655,7 @@ class GatewayRunner:
             Platform.DINGTALK: "DINGTALK_ALLOW_ALL_USERS",
             Platform.FEISHU: "FEISHU_ALLOW_ALL_USERS",
             Platform.WECOM: "WECOM_ALLOW_ALL_USERS",
+            Platform.PUSHOVER: "PUSHOVER_ALLOW_ALL_USERS","
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)

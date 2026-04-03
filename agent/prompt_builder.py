@@ -285,6 +285,11 @@ PLATFORM_HINTS = {
         "only — no markdown, no formatting. SMS messages are limited to ~1600 "
         "characters, so be brief and direct."
     ),
+    "pushover": (
+        "You are sending a Pushover push notification. Keep messages very short — "
+        "Pushover notifications are brief alerts, max 1024 characters. No markdown "
+        "rendering. Use plain text. Pushover is fire-and-forget; do not expect a reply."
+    ),
 }
 
 CONTEXT_FILE_MAX_CHARS = 20_000

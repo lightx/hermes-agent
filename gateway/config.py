@@ -58,6 +58,7 @@ class Platform(Enum):
     HOMEASSISTANT = "homeassistant"
     EMAIL = "email"
     SMS = "sms"
+    PUSHOVER = "pushover"
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
@@ -273,6 +274,9 @@ class GatewayConfig:
                 connected.append(platform)
             # SMS uses api_key (Twilio auth token) — SID checked via env
             elif platform == Platform.SMS and os.getenv("TWILIO_ACCOUNT_SID"):
+                connected.append(platform)
+            # Pushover uses PUSHOVER_APP_TOKEN env var
+            elif platform == Platform.PUSHOVER and os.getenv("PUSHOVER_APP_TOKEN"):
                 connected.append(platform)
             # API Server uses enabled flag only (no token needed)
             elif platform == Platform.API_SERVER:
@@ -813,6 +817,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=sms_home,
             name=os.getenv("SMS_HOME_CHANNEL_NAME", "Home"),
         )
+
+    # Pushover
+    pushover_app = os.getenv("PUSHOVER_APP_TOKEN")
+    pushover_user = os.getenv("PUSHOVER_USER_KEY")
+    if pushover_app and pushover_user:
+        if Platform.PUSHOVER not in config.platforms:
+            config.platforms[Platform.PUSHOVER] = PlatformConfig()
+        config.platforms[Platform.PUSHOVER].enabled = True
+        config.platforms[Platform.PUSHOVER].api_key = os.getenv("PUSHOVER_APP_TOKEN", "")
+        config.platforms[Platform.PUSHOVER].token = os.getenv("PUSHOVER_USER_KEY", "")
 
     # API Server
     api_server_enabled = os.getenv("API_SERVER_ENABLED", "").lower() in ("true", "1", "yes")
