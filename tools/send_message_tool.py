@@ -918,7 +918,6 @@ async def _send_pushover(token: str, user_key: str, message: str) -> Dict[str, A
                     return {"error": f"Pushover API error: {error_msg}"}
     except Exception as e:
         return {"error": f"Pushover send failed: {e}"}
->>>>>>> 6745ade0 (feat: add Pushover platform integration)
 
 
 def _check_send_message():
