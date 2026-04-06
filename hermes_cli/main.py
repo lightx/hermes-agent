@@ -142,6 +142,13 @@ from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 load_hermes_dotenv(project_env=PROJECT_ROOT / '.env')
 
+# Initialize centralized file logging early — all `hermes` subcommands
+# (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
+try:
+    from hermes_logging import setup_logging as _setup_logging
+    _setup_logging(mode="cli")
+except Exception:
+    pass  # best-effort — don't crash the CLI if logging setup fails
 
 import logging
 import time as _time
@@ -1088,10 +1095,13 @@ def _model_flow_openrouter(config, current_model=""):
         print("API key saved.")
         print()
 
-    from hermes_cli.models import model_ids
+    from hermes_cli.models import model_ids, get_pricing_for_provider
     openrouter_models = model_ids()
 
-    selected = _prompt_model_selection(openrouter_models, current_model=current_model)
+    # Fetch live pricing (non-blocking — returns empty dict on failure)
+    pricing = get_pricing_for_provider("openrouter")
+
+    selected = _prompt_model_selection(openrouter_models, current_model=current_model, pricing=pricing)
     if selected:
         _save_model_choice(selected)
 
@@ -1158,7 +1168,7 @@ def _model_flow_nous(config, current_model="", args=None):
     # Already logged in — use curated model list (same as OpenRouter defaults).
     # The live /models endpoint returns hundreds of models; the curated list
     # shows only agentic models users recognize from OpenRouter.
-    from hermes_cli.models import _PROVIDER_MODELS
+    from hermes_cli.models import _PROVIDER_MODELS, get_pricing_for_provider
     model_ids = _PROVIDER_MODELS.get("nous", [])
     if not model_ids:
         print("No curated models available for Nous Portal.")
@@ -1188,7 +1198,10 @@ def _model_flow_nous(config, current_model="", args=None):
         print(f"Could not verify credentials: {msg}")
         return
 
-    selected = _prompt_model_selection(model_ids, current_model=current_model)
+    # Fetch live pricing (non-blocking — returns empty dict on failure)
+    pricing = get_pricing_for_provider("nous")
+
+    selected = _prompt_model_selection(model_ids, current_model=current_model, pricing=pricing)
     if selected:
         _save_model_choice(selected)
         # Reactivate Nous as the provider and update config
@@ -3594,6 +3607,7 @@ def cmd_update(args):
             from hermes_cli.gateway import (
                 is_macos, is_linux, _ensure_user_systemd_env,
                 get_systemd_linger_status, find_gateway_pids,
+                _get_service_pids,
             )
             import signal as _signal
 
@@ -3660,8 +3674,11 @@ def cmd_update(args):
                     pass
 
             # --- Manual (non-service) gateways ---
-            # Kill any remaining gateway processes not managed by a service
-            manual_pids = find_gateway_pids()
+            # Kill any remaining gateway processes not managed by a service.
+            # Exclude PIDs that belong to just-restarted services so we don't
+            # immediately kill the process that systemd/launchd just spawned.
+            service_pids = _get_service_pids()
+            manual_pids = find_gateway_pids(exclude_pids=service_pids)
             for pid in manual_pids:
                 try:
                     os.kill(pid, _signal.SIGTERM)
@@ -3997,6 +4014,26 @@ def cmd_completion(args):
         print(generate_bash_completion())
 
 
+def cmd_logs(args):
+    """View and filter Hermes log files."""
+    from hermes_cli.logs import tail_log, list_logs
+
+    log_name = getattr(args, "log_name", "agent") or "agent"
+
+    if log_name == "list":
+        list_logs()
+        return
+
+    tail_log(
+        log_name,
+        num_lines=getattr(args, "lines", 50),
+        follow=getattr(args, "follow", False),
+        level=getattr(args, "level", None),
+        session=getattr(args, "session", None),
+        since=getattr(args, "since", None),
+    )
+
+
 def main():
     """Main entry point for hermes CLI."""
     parser = argparse.ArgumentParser(
@@ -4027,6 +4064,10 @@ Examples:
     hermes sessions list          List past sessions
     hermes sessions browse        Interactive session picker
     hermes sessions rename ID T   Rename/title a session
+    hermes logs                   View agent.log (last 50 lines)
+    hermes logs -f                Follow agent.log in real time
+    hermes logs errors            View errors.log
+    hermes logs --since 1h        Lines from the last hour
     hermes update                 Update to latest version
 
 For more help on a command:
@@ -4732,106 +4773,23 @@ For more help on a command:
     plugins_parser.set_defaults(func=cmd_plugins)
 
     # =========================================================================
-    # honcho command — Honcho-specific config (peer, mode, tokens, profiles)
-    # Provider selection happens via 'hermes memory setup'.
+    # Plugin CLI commands — dynamically registered by memory/general plugins.
+    # Plugins provide a register_cli(subparser) function that builds their
+    # own argparse tree.  No hardcoded plugin commands in main.py.
     # =========================================================================
-    honcho_parser = subparsers.add_parser(
-        "honcho",
-        help="Manage Honcho memory provider config (peer, mode, profiles)",
-        description=(
-            "Configure Honcho-specific settings. Honcho is now a memory provider\n"
-            "plugin — initial setup is via 'hermes memory setup'. These commands\n"
-            "manage Honcho's own config: peer names, memory mode, token budgets,\n"
-            "per-profile host blocks, and cross-profile observability."
-        ),
-        formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
-    )
-    honcho_parser.add_argument(
-        "--target-profile", metavar="NAME", dest="target_profile",
-        help="Target a specific profile's Honcho config without switching",
-    )
-    honcho_subparsers = honcho_parser.add_subparsers(dest="honcho_command")
-
-    honcho_subparsers.add_parser("setup", help="Initial Honcho setup (redirects to hermes memory setup)")
-    honcho_status = honcho_subparsers.add_parser("status", help="Show current Honcho config and connection status")
-    honcho_status.add_argument("--all", action="store_true", help="Show config overview across all profiles")
-    honcho_subparsers.add_parser("peers", help="Show peer identities across all profiles")
-    honcho_subparsers.add_parser("sessions", help="List known Honcho session mappings")
-
-    honcho_map = honcho_subparsers.add_parser(
-        "map", help="Map current directory to a Honcho session name (no arg = list mappings)"
-    )
-    honcho_map.add_argument(
-        "session_name", nargs="?", default=None,
-        help="Session name to associate with this directory. Omit to list current mappings.",
-    )
-
-    honcho_peer = honcho_subparsers.add_parser(
-        "peer", help="Show or update peer names and dialectic reasoning level"
-    )
-    honcho_peer.add_argument("--user", metavar="NAME", help="Set user peer name")
-    honcho_peer.add_argument("--ai", metavar="NAME", help="Set AI peer name")
-    honcho_peer.add_argument(
-        "--reasoning",
-        metavar="LEVEL",
-        choices=("minimal", "low", "medium", "high", "max"),
-        help="Set default dialectic reasoning level (minimal/low/medium/high/max)",
-    )
-
-    honcho_mode = honcho_subparsers.add_parser(
-        "mode", help="Show or set memory mode (hybrid/honcho/local)"
-    )
-    honcho_mode.add_argument(
-        "mode", nargs="?", metavar="MODE",
-        choices=("hybrid", "honcho", "local"),
-        help="Memory mode to set (hybrid/honcho/local). Omit to show current.",
-    )
-
-    honcho_tokens = honcho_subparsers.add_parser(
-        "tokens", help="Show or set token budget for context and dialectic"
-    )
-    honcho_tokens.add_argument(
-        "--context", type=int, metavar="N",
-        help="Max tokens Honcho returns from session.context() per turn",
-    )
-    honcho_tokens.add_argument(
-        "--dialectic", type=int, metavar="N",
-        help="Max chars of dialectic result to inject into system prompt",
-    )
-
-    honcho_identity = honcho_subparsers.add_parser(
-        "identity", help="Seed or show the AI peer's Honcho identity representation"
-    )
-    honcho_identity.add_argument(
-        "file", nargs="?", default=None,
-        help="Path to file to seed from (e.g. SOUL.md). Omit to show usage.",
-    )
-    honcho_identity.add_argument(
-        "--show", action="store_true",
-        help="Show current AI peer representation from Honcho",
-    )
-
-    honcho_subparsers.add_parser(
-        "migrate",
-        help="Step-by-step migration guide from openclaw-honcho to Hermes Honcho",
-    )
-    honcho_subparsers.add_parser("enable", help="Enable Honcho for the active profile")
-    honcho_subparsers.add_parser("disable", help="Disable Honcho for the active profile")
-    honcho_subparsers.add_parser("sync", help="Sync Honcho config to all existing profiles")
-
-    def cmd_honcho(args):
-        sub = getattr(args, "honcho_command", None)
-        if sub == "setup":
-            # Redirect to the generic memory setup
-            print("\n  Honcho is now configured via the memory provider system.")
-            print("  Running 'hermes memory setup'...\n")
-            from hermes_cli.memory_setup import memory_command
-            memory_command(args)
-            return
-        from plugins.memory.honcho.cli import honcho_command
-        honcho_command(args)
-
-    honcho_parser.set_defaults(func=cmd_honcho)
+    try:
+        from plugins.memory import discover_plugin_cli_commands
+        for cmd_info in discover_plugin_cli_commands():
+            plugin_parser = subparsers.add_parser(
+                cmd_info["name"],
+                help=cmd_info["help"],
+                description=cmd_info.get("description", ""),
+                formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
+            )
+            cmd_info["setup_fn"](plugin_parser)
+    except Exception as _exc:
+        import logging as _log
+        _log.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 
     # =========================================================================
     # memory command
@@ -5432,6 +5390,53 @@ For more help on a command:
         help="Shell type (default: bash)",
     )
     completion_parser.set_defaults(func=cmd_completion)
+
+    # =========================================================================
+    # logs command
+    # =========================================================================
+    logs_parser = subparsers.add_parser(
+        "logs",
+        help="View and filter Hermes log files",
+        description="View, tail, and filter agent.log / errors.log / gateway.log",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+    hermes logs                    Show last 50 lines of agent.log
+    hermes logs -f                 Follow agent.log in real time
+    hermes logs errors             Show last 50 lines of errors.log
+    hermes logs gateway -n 100     Show last 100 lines of gateway.log
+    hermes logs --level WARNING    Only show WARNING and above
+    hermes logs --session abc123   Filter by session ID
+    hermes logs --since 1h         Lines from the last hour
+    hermes logs --since 30m -f     Follow, starting from 30 min ago
+    hermes logs list               List available log files with sizes
+""",
+    )
+    logs_parser.add_argument(
+        "log_name", nargs="?", default="agent",
+        help="Log to view: agent (default), errors, gateway, or 'list' to show available files",
+    )
+    logs_parser.add_argument(
+        "-n", "--lines", type=int, default=50,
+        help="Number of lines to show (default: 50)",
+    )
+    logs_parser.add_argument(
+        "-f", "--follow", action="store_true",
+        help="Follow the log in real time (like tail -f)",
+    )
+    logs_parser.add_argument(
+        "--level", metavar="LEVEL",
+        help="Minimum log level to show (DEBUG, INFO, WARNING, ERROR)",
+    )
+    logs_parser.add_argument(
+        "--session", metavar="ID",
+        help="Filter lines containing this session ID substring",
+    )
+    logs_parser.add_argument(
+        "--since", metavar="TIME",
+        help="Show lines since TIME ago (e.g. 1h, 30m, 2d)",
+    )
+    logs_parser.set_defaults(func=cmd_logs)
 
     # =========================================================================
     # Parse and execute

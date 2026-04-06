@@ -453,6 +453,21 @@ def load_cli_config() -> Dict[str, Any]:
 # Load configuration at module startup
 CLI_CONFIG = load_cli_config()
 
+# Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
+# This ensures CLI sessions produce a log trail even before AIAgent is instantiated.
+try:
+    from hermes_logging import setup_logging
+    setup_logging(mode="cli")
+except Exception:
+    pass  # Logging setup is best-effort — don't crash the CLI
+
+# Validate config structure early — print warnings before user hits cryptic errors
+try:
+    from hermes_cli.config import print_config_warnings
+    print_config_warnings()
+except Exception:
+    pass
+
 # Initialize the skin engine from config
 try:
     from hermes_cli.skin_engine import init_skin_from_config
@@ -1257,8 +1272,11 @@ class HermesCLI:
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
         if toolsets and "all" not in toolsets and "*" not in toolsets:
-            # Validate each toolset
-            invalid = [t for t in toolsets if not validate_toolset(t)]
+            # Validate each toolset — MCP server names are added by
+            # _get_platform_tools() but aren't registered in TOOLSETS yet
+            # (that happens later in _sync_mcp_toolsets), so exclude them.
+            mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
+            invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
             if invalid:
                 self.console.print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
         
@@ -2354,6 +2372,22 @@ class HermesCLI:
                 self.console.print(
                     "[dim]   Fix: Set model.context_length in config.yaml, or increase your server's context setting[/]"
                 )
+
+        # Warn if the configured model is a Nous Hermes LLM (not agentic)
+        model_name = getattr(self, "model", "") or ""
+        if "hermes" in model_name.lower():
+            self.console.print()
+            self.console.print(
+                "[bold yellow]⚠  Nous Research Hermes 3 & 4 models are NOT agentic and are not "
+                "designed for use with Hermes Agent.[/]"
+            )
+            self.console.print(
+                "[dim]   They lack tool-calling capabilities required for agent workflows. "
+                "Consider using an agentic model (Claude, GPT, Gemini, DeepSeek, etc.).[/]"
+            )
+            self.console.print(
+                "[dim]   Switch with: /model sonnet  or  /model gpt5[/]"
+            )
 
         self.console.print()
 
@@ -3606,14 +3640,19 @@ class HermesCLI:
             _cprint(f"  ✗ {result.error_message}")
             return
 
-        # Apply to CLI state
+        # Apply to CLI state.
+        # Update requested_provider so _ensure_runtime_credentials() doesn't
+        # overwrite the switch on the next turn (it re-resolves from this).
         old_model = self.model
         self.model = result.new_model
         self.provider = result.target_provider
+        self.requested_provider = result.target_provider
         if result.api_key:
             self.api_key = result.api_key
+            self._explicit_api_key = result.api_key
         if result.base_url:
             self.base_url = result.base_url
+            self._explicit_base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
 
@@ -3629,6 +3668,15 @@ class HermesCLI:
                 )
             except Exception as exc:
                 _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
+
+        # Store a note to prepend to the next user message so the model
+        # knows a switch occurred (avoids injecting system messages mid-history
+        # which breaks providers and prompt caching).
+        self._pending_model_switch_note = (
+            f"[Note: model was just switched from {old_model} to {result.new_model} "
+            f"via {result.provider_label or result.target_provider}. "
+            f"Adjust your self-identification accordingly.]"
+        )
 
         # Display confirmation with full metadata
         provider_label = result.provider_label or result.target_provider
@@ -3689,6 +3737,7 @@ class HermesCLI:
         from hermes_cli.models import (
             curated_models_for_provider, list_available_providers,
             normalize_provider, _PROVIDER_LABELS,
+            get_pricing_for_provider, format_model_pricing_table,
         )
         from hermes_cli.auth import resolve_provider as _resolve_provider
 
@@ -3722,7 +3771,13 @@ class HermesCLI:
                 marker = " ← active" if is_active else ""
                 print(f"    [{p['id']}]{marker}")
                 curated = curated_models_for_provider(p["id"])
-                if curated:
+                # Fetch pricing for providers that support it (openrouter, nous)
+                pricing_map = get_pricing_for_provider(p["id"]) if p["id"] in ("openrouter", "nous") else {}
+                if curated and pricing_map:
+                    cur_model = self.model if is_active else ""
+                    for line in format_model_pricing_table(curated, pricing_map, current_model=cur_model):
+                        print(line)
+                elif curated:
                     for mid, desc in curated:
                         current_marker = " ← current" if (is_active and mid == self.model) else ""
                         print(f"      {mid}{current_marker}")
@@ -5440,14 +5495,17 @@ class HermesCLI:
     # Tool progress callback (audio cues for voice mode)
     # ====================================================================
 
-    def _on_tool_progress(self, function_name: str, preview: str, function_args: dict):
-        """Called when a tool starts executing.
+    def _on_tool_progress(self, event_type: str, function_name: str = None, preview: str = None, function_args: dict = None, **kwargs):
+        """Called on tool lifecycle events (tool.started, tool.completed, reasoning.available, etc.).
 
         Updates the TUI spinner widget so the user can see what the agent
         is doing during tool execution (fills the gap between thinking
         spinner and next response).  Also plays audio cue in voice mode.
         """
-        if not function_name.startswith("_"):
+        # Only act on tool.started; ignore tool.completed, reasoning.available, etc.
+        if event_type != "tool.started":
+            return
+        if function_name and not function_name.startswith("_"):
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(function_name)
             label = preview or function_name
@@ -5460,7 +5518,7 @@ class HermesCLI:
 
         if not self._voice_mode:
             return
-        if function_name.startswith("_"):
+        if not function_name or function_name.startswith("_"):
             return
         try:
             from tools.voice_mode import play_beep
@@ -6347,6 +6405,11 @@ class HermesCLI:
             def run_agent():
                 nonlocal result
                 agent_message = _voice_prefix + message if _voice_prefix else message
+                # Prepend pending model switch note so the model knows about the switch
+                _msn = getattr(self, '_pending_model_switch_note', None)
+                if _msn:
+                    agent_message = _msn + "\n\n" + agent_message
+                    self._pending_model_switch_note = None
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
