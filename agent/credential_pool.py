@@ -14,21 +14,31 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
-import hermes_cli.auth as auth_mod
-from hermes_cli.auth import (
-    ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
-    CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
-    DEFAULT_AGENT_KEY_MIN_TTL_SECONDS,
-    PROVIDER_REGISTRY,
-    _agent_key_is_usable,
-    _codex_access_token_is_expiring,
-    _decode_jwt_claims,
-    _is_expiring,
-    _load_auth_store,
-    _load_provider_state,
-    read_credential_pool,
-    write_credential_pool,
-)
+# AFTER:
+def __getattr__(name):
+    _AUTH_NAMES = frozenset({
+        "ACCESS_TOKEN_REFRESH_SKEW_SECONDS",
+        "CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS",
+        "DEFAULT_AGENT_KEY_MIN_TTL_SECONDS",
+        "PROVIDER_REGISTRY",
+        "_agent_key_is_usable",
+        "_codex_access_token_is_expiring",
+        "_decode_jwt_claims",
+        "_is_expiring",
+        "_load_auth_store",
+        "_load_provider_state",
+        "read_credential_pool",
+        "write_credential_pool",
+    })
+    if name in _AUTH_NAMES:
+        import hermes_cli.auth as _auth
+        return getattr(_auth, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _get_auth_mod():
+    import hermes_cli.auth as _auth
+    return _auth
 
 logger = logging.getLogger(__name__)
 
@@ -474,7 +484,7 @@ class CredentialPool:
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
-                refreshed = auth_mod.refresh_codex_oauth_pure(
+                refreshed = _get_auth_mod().refresh_codex_oauth_pure(
                     entry.access_token,
                     entry.refresh_token,
                 )
@@ -499,7 +509,7 @@ class CredentialPool:
                     "agent_key_expires_at": entry.agent_key_expires_at,
                     "tls": entry.tls,
                 }
-                refreshed = auth_mod.refresh_nous_oauth_from_state(
+                refreshed = _get_auth_mod().refresh_nous_oauth_from_state(
                     nous_state,
                     min_key_ttl_seconds=DEFAULT_AGENT_KEY_MIN_TTL_SECONDS,
                     force_refresh=force,

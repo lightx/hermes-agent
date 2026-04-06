@@ -22,7 +22,18 @@ import tempfile
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
-from tools.tool_backend_helpers import managed_nous_tools_enabled as _managed_nous_tools_enabled
+def _managed_nous_tools_enabled():
+    import importlib.util, sys
+    mod = sys.modules.get("tools.tool_backend_helpers")
+    if mod is None:
+        spec = importlib.util.spec_from_file_location(
+            "tools.tool_backend_helpers",
+            __file__.replace("hermes_cli/config.py", "tools/tool_backend_helpers.py"),
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["tools.tool_backend_helpers"] = mod
+        spec.loader.exec_module(mod)
+    return mod.managed_nous_tools_enabled()
 
 _IS_WINDOWS = platform.system() == "Windows"
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

@@ -375,10 +375,16 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-obsidian": {
+        "description": "Obsidian vault semantic search via ChromaDB",
+        "tools": _HERMES_CORE_TOOLS + ["obsidian_search"],
+        "includes": []
+    },
+
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-webhook", "hermes-pushover"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-webhook", "hermes-pushover", "hermes-obsidian"]
     }
 }
 
