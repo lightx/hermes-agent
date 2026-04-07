@@ -93,6 +93,7 @@ auxiliary_is_nous: bool = False
 # Default auxiliary models per provider
 _OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 _NOUS_MODEL = "google/gemini-3-flash-preview"
+_NOUS_FREE_TIER_VISION_MODEL = "xiaomi/mimo-v2-omni"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = None
@@ -216,7 +217,6 @@ class _CodexCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
-        temperature = kwargs.get("temperature")
 
         # Separate system/instructions from conversation messages.
         # Convert chat.completions multimodal content blocks to Responses
@@ -728,7 +728,19 @@ def _try_nous() -> Tuple[Optional[OpenAI], Optional[str]]:
     global auxiliary_is_nous
     auxiliary_is_nous = True
     logger.debug("Auxiliary client: Nous Portal")
-    model = "gemini-3-flash" if nous.get("source") == "pool" else _NOUS_MODEL
+    if nous.get("source") == "pool":
+        model = "gemini-3-flash"
+    else:
+        model = _NOUS_MODEL
+    # Free-tier users can't use paid auxiliary models — use the free
+    # multimodal model instead so vision/browser-vision still works.
+    try:
+        from hermes_cli.models import check_nous_free_tier
+        if check_nous_free_tier():
+            model = _NOUS_FREE_TIER_VISION_MODEL
+            logger.debug("Free-tier Nous account — using %s for auxiliary/vision", model)
+    except Exception:
+        pass
     return (
         OpenAI(
             api_key=_nous_api_key(nous),

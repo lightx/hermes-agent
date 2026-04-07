@@ -24,7 +24,6 @@ import signal
 import tempfile
 import threading
 import time
-import uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
@@ -378,7 +377,7 @@ def _check_unavailable_skill(command_name: str) -> str | None:
                     )
 
         # Check optional skills (shipped with repo but not installed)
-        from hermes_constants import get_hermes_home, get_optional_skills_dir
+        from hermes_constants import get_optional_skills_dir
         repo_root = Path(__file__).resolve().parent.parent
         optional_dir = get_optional_skills_dir(repo_root / "optional-skills")
         if optional_dir.exists():
@@ -1889,6 +1888,11 @@ class GatewayRunner:
         if _quick_key in self._running_agents and _stale_ts:
             _stale_age = time.time() - _stale_ts
             _stale_agent = self._running_agents.get(_quick_key)
+            # Never evict the pending sentinel — it was just placed moments
+            # ago during the async setup phase before the real agent is
+            # created.  Sentinels have no get_activity_summary(), so the
+            # idle check below would always evaluate to inf >= timeout and
+            # immediately evict them, racing with the setup path.
             _stale_idle = float("inf")  # assume idle if we can't check
             _stale_detail = ""
             if _stale_agent and hasattr(_stale_agent, "get_activity_summary"):
@@ -1907,8 +1911,11 @@ class GatewayRunner:
             # cases where the agent object was garbage-collected).
             _wall_ttl = max(_raw_stale_timeout * 10, 7200) if _raw_stale_timeout > 0 else float("inf")
             _should_evict = (
-                (_raw_stale_timeout > 0 and _stale_idle >= _raw_stale_timeout)
-                or _stale_age > _wall_ttl
+                _stale_agent is not _AGENT_PENDING_SENTINEL
+                and (
+                    (_raw_stale_timeout > 0 and _stale_idle >= _raw_stale_timeout)
+                    or _stale_age > _wall_ttl
+                )
             )
             if _should_evict:
                 logger.warning(
@@ -2845,7 +2852,7 @@ class GatewayRunner:
                         guessed, _ = _mimetypes.guess_type(path)
                         if guessed:
                             mtype = guessed
-                if not (mtype.startswith("application/") or mtype.startswith("text/")):
+                if not mtype.startswith(("application/", "text/")):
                     continue
                 # Extract display filename by stripping the doc_{uuid12}_ prefix
                 import os as _os
@@ -3932,7 +3939,7 @@ class GatewayRunner:
 
             return f"🎭 Personality set to **{args}**\n_(takes effect on next message)_"
 
-        available = "`none`, " + ", ".join(f"`{n}`" for n in personalities.keys())
+        available = "`none`, " + ", ".join(f"`{n}`" for n in personalities)
         return f"Unknown personality: `{args}`\n\nAvailable: {available}"
     
     async def _handle_retry_command(self, event: MessageEvent) -> str:
@@ -5344,9 +5351,6 @@ class GatewayRunner:
                 old_servers = set(_servers.keys())
 
             # Read new config before shutting down, so we know what will be added/removed
-            new_config = _load_mcp_config()
-            new_server_names = set(new_config.keys())
-
             # Shutdown existing connections
             await loop.run_in_executor(None, shutdown_mcp_servers)
 
@@ -5434,7 +5438,6 @@ class GatewayRunner:
 
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
-            pending_approval_count,
         )
 
         if not has_blocking_approval(session_key):
