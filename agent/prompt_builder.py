@@ -187,7 +187,7 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
-TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma")
+TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
@@ -749,7 +749,6 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
         "browser_type",
         "browser_scroll",
         "browser_console",
-        "browser_close",
         "browser_press",
         "browser_get_images",
         "browser_vision",
@@ -779,13 +778,13 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 
     lines = [
         "# Nous Subscription",
-        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, and browser automation (Browserbase) by default. Modal execution is optional.",
+        "Nous subscription includes managed web tools (Firecrawl), image generation (FAL), OpenAI TTS, and browser automation (Browser Use) by default. Modal execution is optional.",
         "Current capability status:",
     ]
     lines.extend(_status_line(feature) for feature in features.items())
     lines.extend(
         [
-            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, or Browserbase API keys.",
+            "When a Nous-managed feature is active, do not ask the user for Firecrawl, FAL, OpenAI TTS, or Browser-Use API keys.",
             "If the user is not subscribed and asks for a capability that Nous subscription would unlock or simplify, suggest Nous subscription as one option alongside direct setup or local alternatives.",
             "Do not mention subscription unless the user asks about it or it directly solves the current missing capability.",
             "Useful commands: hermes setup, hermes setup tools, hermes setup terminal, hermes status.",
