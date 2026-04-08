@@ -142,12 +142,6 @@ from tools.approval import (
 )
 
 
-def _check_dangerous_command(command: str, env_type: str) -> dict:
-    """Delegate to the consolidated approval module, passing the CLI callback."""
-    return _check_dangerous_command_impl(command, env_type,
-                                         approval_callback=_approval_callback)
-
-
 def _check_all_guards(command: str, env_type: str) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
@@ -815,6 +809,12 @@ def _stop_cleanup_thread():
             _cleanup_thread.join(timeout=5)
         except (SystemExit, KeyboardInterrupt):
             pass
+
+
+def get_active_env(task_id: str):
+    """Return the active BaseEnvironment for *task_id*, or None."""
+    with _env_lock:
+        return _active_environments.get(task_id)
 
 
 def get_active_environments_info() -> Dict[str, Any]:
@@ -1623,4 +1623,5 @@ registry.register(
     handler=_handle_terminal,
     check_fn=check_terminal_requirements,
     emoji="💻",
+    max_result_size_chars=100_000,
 )
