@@ -2,11 +2,12 @@
 { inputs, ... }: {
   perSystem = { pkgs, ... }:
     let
-      python = pkgs.python311;
+      python = pkgs.python313;
+      pytest = python.pkgs.pytest;
     in {
       devShells.default = pkgs.mkShell {
         packages = with pkgs; [
-          python uv nodejs_20 ripgrep git openssh ffmpeg
+          python uv nodejs_20 ripgrep git openssh ffmpeg pytest
         ];
 
         shellHook = ''
@@ -18,7 +19,7 @@
 
           # Create venv if missing
           if [ ! -d .venv ]; then
-            echo "Creating Python 3.11 venv..."
+            echo "Creating Python 3.13 venv..."
             uv venv .venv --python ${python}/bin/python3
           fi
 

@@ -74,11 +74,46 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
-def _resolve_delivery_target(job: dict) -> Optional[dict]:
-    """Resolve the concrete auto-delivery target for a cron job, if any."""
+def _resolve_delivery_target(job: dict) -> Optional[dict | list[dict]]:
+    """Resolve the concrete auto-delivery target for a cron job, if any.
+
+    Returns a single target dict, a list of target dicts, or None.
+    """
     deliver = job.get("deliver", "local")
     origin = _resolve_origin(job)
 
+    # Normalize deliver to a list to handle both single values and multiple targets.
+    # Also handle space-separated string (e.g. "local pushover") as a fallback.
+    if isinstance(deliver, list):
+        deliver_targets = deliver
+    elif isinstance(deliver, str):
+        deliver_targets = deliver.split() if " " in deliver else [deliver]
+    else:
+        deliver_targets = [str(deliver)] if deliver else ["local"]
+
+    # Filter out "local" since it means no auto-delivery.
+    platform_targets = [d for d in deliver_targets if d and d != "local"]
+
+    if not platform_targets:
+        return None
+
+    # Build a list of resolved targets, one per platform value.
+    results: list[dict] = []
+    for d in platform_targets:
+        target = _resolve_single_delivery_target(d, origin, job)
+        if target:
+            results.append(target)
+
+    if not results:
+        return None
+
+    # Return a list when multiple platforms were resolved, otherwise a single dict.
+    return results if len(results) > 1 else results[0]
+
+
+def _resolve_single_delivery_target(deliver: str, origin: dict | None, job: dict | None = None) -> Optional[dict]:
+    """Resolve a single deliver string to a delivery target dict."""
+    job_name = job.get("name", job.get("id", "?")) if job else "?"
     if deliver == "local":
         return None
 
@@ -96,7 +131,7 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
             if chat_id:
                 logger.info(
                     "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
-                    job.get("name", job.get("id", "?")),
+                    job_name,
                     platform_name,
                 )
                 return {
@@ -205,16 +240,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
-    Returns None on success, or an error string on failure.
+    Returns None on success, or an error string on failure. When multiple targets
+    are configured, returns the first error encountered (if any), after
+    attempting delivery to all targets.
     """
-    target = _resolve_delivery_target(job)
-    if not target:
-        if job.get("deliver", "local") != "local":
+    targets = _resolve_delivery_target(job)
+    if not targets:
+        if job.get("deliver", "local") not in ("local", "Local"):
             msg = f"no delivery target resolved for deliver={job.get('deliver', 'local')}"
             logger.warning("Job '%s': %s", job["id"], msg)
             return msg
         return None  # local-only jobs don't deliver — not a failure
 
+    # Normalize to a list for uniform iteration.
+    if isinstance(targets, dict):
+        targets = [targets]
+
+    first_error = None
+    for target in targets:
+        err = _deliver_to_target(job, target, content, adapters, loop)
+        if err and first_error is None:
+            first_error = err
+
+    return first_error
+
+
+def _deliver_to_target(job: dict, target: dict, content: str, adapters, loop) -> Optional[str]:
+    """Deliver job content to a single target. Returns None on success, error string on failure."""
     platform_name = target["platform"]
     chat_id = target["chat_id"]
     thread_id = target.get("thread_id")
@@ -240,26 +292,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     }
     platform = platform_map.get(platform_name.lower())
     if not platform:
-        msg = f"unknown platform '{platform_name}'"
-        logger.warning("Job '%s': %s", job["id"], msg)
-        return msg
+        return f"unknown platform '{platform_name}'"
 
     try:
         config = load_gateway_config()
     except Exception as e:
-        msg = f"failed to load gateway config: {e}"
-        logger.error("Job '%s': %s", job["id"], msg)
-        return msg
+        return f"failed to load gateway config: {e}"
 
     pconfig = config.platforms.get(platform)
     if not pconfig or not pconfig.enabled:
-        msg = f"platform '{platform_name}' not configured/enabled"
-        logger.warning("Job '%s': %s", job["id"], msg)
-        return msg
+        return f"platform '{platform_name}' not configured/enabled"
 
-    # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
     wrap_response = True
     try:
         user_cfg = load_config()
@@ -278,17 +321,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     else:
         delivery_content = content
 
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
 
-    # Prefer the live adapter when the gateway is running — this supports E2EE
-    # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
     runtime_adapter = (adapters or {}).get(platform)
     if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
         send_metadata = {"thread_id": thread_id} if thread_id else None
         try:
-            # Send cleaned text (MEDIA tags stripped) — not the raw content
             text_to_send = cleaned_delivery_content.strip()
             adapter_ok = True
             if text_to_send:
@@ -303,9 +342,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
                         job["id"], platform_name, chat_id, err,
                     )
-                    adapter_ok = False  # fall through to standalone path
+                    adapter_ok = False
 
-            # Send extracted media files as native attachments via the live adapter
             if adapter_ok and media_files:
                 _send_media_via_adapter(runtime_adapter, chat_id, media_files, send_metadata, loop, job)
 
@@ -318,29 +356,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 job["id"], platform_name, chat_id, e,
             )
 
-    # Standalone path: run the async send in a fresh event loop (safe from any thread)
     coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
     try:
         result = asyncio.run(coro)
     except RuntimeError:
-        # asyncio.run() checks for a running loop before awaiting the coroutine;
-        # when it raises, the original coro was never started — close it to
-        # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
-        # fresh thread that has no running loop.
         coro.close()
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
             result = future.result(timeout=30)
     except Exception as e:
-        msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
-        logger.error("Job '%s': %s", job["id"], msg)
-        return msg
+        return f"delivery to {platform_name}:{chat_id} failed: {e}"
 
     if result and result.get("error"):
-        msg = f"delivery error: {result['error']}"
-        logger.error("Job '%s': %s", job["id"], msg)
-        return msg
+        return f"delivery error: {result['error']}"
 
     logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
     return None
@@ -561,11 +590,15 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
 
         delivery_target = _resolve_delivery_target(job)
-        if delivery_target:
-            os.environ["HERMES_CRON_AUTO_DELIVER_PLATFORM"] = delivery_target["platform"]
-            os.environ["HERMES_CRON_AUTO_DELIVER_CHAT_ID"] = str(delivery_target["chat_id"])
-            if delivery_target.get("thread_id") is not None:
-                os.environ["HERMES_CRON_AUTO_DELIVER_THREAD_ID"] = str(delivery_target["thread_id"])
+        # Handle both single-target (dict) and multi-target (list of dicts) results.
+        # Use the first resolved target for env vars; multi-target delivery is
+        # handled later in _deliver_result.
+        primary_target = delivery_target[0] if isinstance(delivery_target, list) else delivery_target
+        if primary_target:
+            os.environ["HERMES_CRON_AUTO_DELIVER_PLATFORM"] = primary_target["platform"]
+            os.environ["HERMES_CRON_AUTO_DELIVER_CHAT_ID"] = str(primary_target["chat_id"])
+            if primary_target.get("thread_id") is not None:
+                os.environ["HERMES_CRON_AUTO_DELIVER_THREAD_ID"] = str(primary_target["thread_id"])
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
