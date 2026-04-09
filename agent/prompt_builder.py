@@ -354,6 +354,13 @@ PLATFORM_HINTS = {
         "Pushover notifications are brief alerts, max 1024 characters. No markdown "
         "rendering. Use plain text. Pushover is fire-and-forget; do not expect a reply."
     ),
+    "bluebubbles": (
+        "You are chatting via iMessage (BlueBubbles). iMessage does not render "
+        "markdown formatting — use plain text. Keep responses concise as they "
+        "appear as text messages. You can send media files natively: include "
+        "MEDIA:/absolute/path/to/file in your response. Images (.jpg, .png, "
+        ".heic) appear as photos and other files arrive as attachments."
+    ),
 }
 
 CONTEXT_FILE_MAX_CHARS = 20_000

@@ -66,7 +66,7 @@ from model_tools import (
     handle_function_call,
     check_toolset_requirements,
 )
-from tools.terminal_tool import cleanup_vm, get_active_env
+from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
 from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
@@ -442,6 +442,13 @@ class AIAgent:
     for AI models that support function calling.
     """
 
+    # ── Class-level context pressure dedup (survives across instances) ──
+    # The gateway creates a new AIAgent per message, so instance-level flags
+    # reset every time.  This dict tracks {session_id: (warn_level, timestamp)}
+    # to suppress duplicate warnings within a cooldown window.
+    _context_pressure_last_warned: dict = {}
+    _CONTEXT_PRESSURE_COOLDOWN = 300  # seconds between re-warning same session
+
     @property
     def base_url(self) -> str:
         return self._base_url
@@ -673,7 +680,8 @@ class AIAgent:
         # Context pressure warnings: notify the USER (not the LLM) as context
         # fills up.  Purely informational — displayed in CLI output and sent via
         # status_callback for gateway platforms.  Does NOT inject into messages.
-        self._context_pressure_warned = False
+        # Tiered: fires at 85% and again at 95% of compaction threshold.
+        self._context_pressure_warned_at = 0.0  # highest tier already shown
 
         # Activity tracking — updated on each API call, tool execution, and
         # stream chunk.  Used by the gateway timeout handler to report what the
@@ -683,6 +691,10 @@ class AIAgent:
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
+
+        # Rate limit tracking — updated from x-ratelimit-* response headers
+        # after each API call.  Accessed by /usage slash command.
+        self._rate_limit_state: Optional["RateLimitState"] = None
 
         # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
         # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
@@ -1687,9 +1699,25 @@ class AIAgent:
         return None
 
     def _cleanup_task_resources(self, task_id: str) -> None:
-        """Clean up VM and browser resources for a given task."""
+        """Clean up VM and browser resources for a given task.
+
+        Skips ``cleanup_vm`` when the active terminal environment is marked
+        persistent (``persistent_filesystem=True``) so that long-lived sandbox
+        containers survive between turns. The idle reaper in
+        ``terminal_tool._cleanup_inactive_envs`` still tears them down once
+        ``terminal.lifetime_seconds`` is exceeded. Non-persistent backends are
+        torn down per-turn as before to prevent resource leakage (the original
+        intent of this hook for the Morph backend, see commit fbd3a2fd).
+        """
         try:
-            cleanup_vm(task_id)
+            if is_persistent_env(task_id):
+                if self.verbose_logging:
+                    logging.debug(
+                        f"Skipping per-turn cleanup_vm for persistent env {task_id}; "
+                        f"idle reaper will handle it."
+                    )
+            else:
+                cleanup_vm(task_id)
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to cleanup VM for task {task_id}: {e}")
@@ -2520,6 +2548,29 @@ class AIAgent:
         """Update the last-activity timestamp and description (thread-safe)."""
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
+
+    def _capture_rate_limits(self, http_response: Any) -> None:
+        """Parse x-ratelimit-* headers from an HTTP response and cache the state.
+
+        Called after each streaming API call.  The httpx Response object is
+        available on the OpenAI SDK Stream via ``stream.response``.
+        """
+        if http_response is None:
+            return
+        headers = getattr(http_response, "headers", None)
+        if not headers:
+            return
+        try:
+            from agent.rate_limit_tracker import parse_rate_limit_headers
+            state = parse_rate_limit_headers(headers, provider=self.provider)
+            if state is not None:
+                self._rate_limit_state = state
+        except Exception:
+            pass  # Never let header parsing break the agent loop
+
+    def get_rate_limit_state(self):
+        """Return the last captured RateLimitState, or None."""
+        return self._rate_limit_state
 
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
@@ -4375,6 +4426,11 @@ class AIAgent:
             self._touch_activity("waiting for provider response (streaming)")
             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
 
+            # Capture rate limit headers from the initial HTTP response.
+            # The OpenAI SDK Stream object exposes the underlying httpx
+            # response via .response before any chunks are consumed.
+            self._capture_rate_limits(getattr(stream, "response", None))
+
             content_parts: list = []
             tool_calls_acc: dict = {}
             tool_gen_notified: set = set()
@@ -4728,18 +4784,25 @@ class AIAgent:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
         _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
-        # Scale the stale timeout for large contexts: slow models (like Opus)
-        # can legitimately think for minutes before producing the first token
-        # when the context is large.  Without this, the stale detector kills
-        # healthy connections during the model's thinking phase, producing
-        # spurious RemoteProtocolError ("peer closed connection").
-        _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-        if _est_tokens > 100_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
-        elif _est_tokens > 50_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
+        # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
+        # for prefill on large contexts.  Disable the stale detector unless
+        # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
+        if _stream_stale_timeout_base == 180.0 and self.base_url and is_local_endpoint(self.base_url):
+            _stream_stale_timeout = float("inf")
+            logger.debug("Local provider detected (%s) — stale stream timeout disabled", self.base_url)
         else:
-            _stream_stale_timeout = _stream_stale_timeout_base
+            # Scale the stale timeout for large contexts: slow models (like Opus)
+            # can legitimately think for minutes before producing the first token
+            # when the context is large.  Without this, the stale detector kills
+            # healthy connections during the model's thinking phase, producing
+            # spurious RemoteProtocolError ("peer closed connection").
+            _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            if _est_tokens > 100_000:
+                _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
+            elif _est_tokens > 50_000:
+                _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
+            else:
+                _stream_stale_timeout = _stream_stale_timeout_base
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
@@ -4895,7 +4958,7 @@ class AIAgent:
                 effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
                 self.api_key = effective_key
                 self._anthropic_api_key = effective_key
-                self._anthropic_base_url = getattr(fb_client, "base_url", None)
+                self._anthropic_base_url = fb_base_url
                 self._anthropic_client = build_anthropic_client(effective_key, self._anthropic_base_url)
                 self._is_anthropic_oauth = _is_oauth_token(effective_key)
                 self.client = None
@@ -5334,6 +5397,7 @@ class AIAgent:
                 is_oauth=self._is_anthropic_oauth,
                 preserve_dots=self._anthropic_preserve_dots(),
                 context_length=ctx_len,
+                base_url=getattr(self, "_anthropic_base_url", None),
             )
 
         if self.api_mode == "codex_responses":
@@ -5863,7 +5927,7 @@ class AIAgent:
                     tools=[memory_tool_def],
                     temperature=0.3,
                     max_tokens=5120,
-                    timeout=30.0,
+                    # timeout resolved from auxiliary.flush_memories.timeout config
                 )
             except RuntimeError:
                 _aux_available = False
@@ -5895,7 +5959,10 @@ class AIAgent:
                     "temperature": 0.3,
                     **self._max_tokens_param(5120),
                 }
-                response = self._ensure_primary_openai_client(reason="flush_memories").chat.completions.create(**api_kwargs, timeout=30.0)
+                from agent.auxiliary_client import _get_task_timeout
+                response = self._ensure_primary_openai_client(reason="flush_memories").chat.completions.create(
+                    **api_kwargs, timeout=_get_task_timeout("flush_memories")
+                )
 
             # Extract tool calls from the response, handling all API formats
             tool_calls = []
@@ -6002,6 +6069,15 @@ class AIAgent:
             except Exception as e:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
+        # Warn on repeated compressions (quality degrades with each pass)
+        _cc = self.context_compressor.compression_count
+        if _cc >= 2:
+            self._vprint(
+                f"{self.log_prefix}⚠️  Session compressed {_cc} times — "
+                f"accuracy may degrade. Consider /new to start fresh.",
+                force=True,
+            )
+
         # Update token estimate after compaction so pressure calculations
         # use the post-compression count, not the stale pre-compression one.
         _compressed_est = (
@@ -6014,12 +6090,16 @@ class AIAgent:
         # Only reset the pressure warning if compression actually brought
         # us below the warning level (85% of threshold).  When compression
         # can't reduce enough (e.g. threshold is very low, or system prompt
-        # alone exceeds the warning level), keep the flag set to prevent
+        # alone exceeds the warning level), keep the tier set to prevent
         # spamming the user with repeated warnings every loop iteration.
         if self.context_compressor.threshold_tokens > 0:
             _post_progress = _compressed_est / self.context_compressor.threshold_tokens
             if _post_progress < 0.85:
-                self._context_pressure_warned = False
+                self._context_pressure_warned_at = 0.0
+                # Clear class-level dedup for this session so a fresh
+                # warning cycle can start if context grows again.
+                _sid = self.session_id or "default"
+                AIAgent._context_pressure_last_warned.pop(_sid, None)
 
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same
@@ -8959,13 +9039,34 @@ class AIAgent:
                     # compaction fires, not the raw context window.
                     # Does not inject into messages — just prints to CLI output
                     # and fires status_callback for gateway platforms.
+                    # Tiered: 85% (orange) and 95% (red/critical).
                     if _compressor.threshold_tokens > 0:
                         _compaction_progress = _real_tokens / _compressor.threshold_tokens
-                        if _compaction_progress >= 0.85 and not self._context_pressure_warned:
-                            self._context_pressure_warned = True
-                            self._emit_context_pressure(_compaction_progress, _compressor)
+                        # Determine the warning tier for this progress level
+                        _warn_tier = 0.0
+                        if _compaction_progress >= 0.95:
+                            _warn_tier = 0.95
+                        elif _compaction_progress >= 0.85:
+                            _warn_tier = 0.85
+                        if _warn_tier > self._context_pressure_warned_at:
+                            # Class-level dedup: check if this session was already
+                            # warned at this tier within the cooldown window.
+                            _sid = self.session_id or "default"
+                            _last = AIAgent._context_pressure_last_warned.get(_sid)
+                            _now = time.time()
+                            if _last is None or _last[0] < _warn_tier or (_now - _last[1]) >= self._CONTEXT_PRESSURE_COOLDOWN:
+                                self._context_pressure_warned_at = _warn_tier
+                                AIAgent._context_pressure_last_warned[_sid] = (_warn_tier, _now)
+                                self._emit_context_pressure(_compaction_progress, _compressor)
+                                # Evict stale entries (older than 2x cooldown)
+                                _cutoff = _now - self._CONTEXT_PRESSURE_COOLDOWN * 2
+                                AIAgent._context_pressure_last_warned = {
+                                    k: v for k, v in AIAgent._context_pressure_last_warned.items()
+                                    if v[1] > _cutoff
+                                }
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
+                        self._safe_print("  ⟳ compacting context…")
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,
@@ -9040,8 +9141,27 @@ class AIAgent:
                             self._save_session_log(messages)
                             continue
 
-                        # Exhausted prefill attempts or no structured
-                        # reasoning — fall through to "(empty)" terminal.
+                        # ── Empty response retry (no reasoning) ──────
+                        # Model returned nothing — no content, no
+                        # structured reasoning, no tool calls.  Common
+                        # with open models (transient provider issues,
+                        # rate limits, sampling flukes).  Silently retry
+                        # up to 3 times before giving up.  Skip when
+                        # content has inline <think> tags (model chose
+                        # to reason, just no visible text).
+                        _truly_empty = not final_response.strip()
+                        if _truly_empty and not _has_structured and self._empty_content_retries < 3:
+                            self._empty_content_retries += 1
+                            self._vprint(
+                                f"{self.log_prefix}↻ Empty response (no content or reasoning) "
+                                f"— retrying ({self._empty_content_retries}/3)",
+                                force=True,
+                            )
+                            continue
+
+                        # Exhausted prefill attempts, empty retries, or
+                        # structured reasoning with no content —
+                        # fall through to "(empty)" terminal.
                         reasoning_text = self._extract_reasoning(assistant_message)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         assistant_msg["content"] = "(empty)"
@@ -9051,7 +9171,7 @@ class AIAgent:
                             reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
                             self._vprint(f"{self.log_prefix}ℹ️  Reasoning-only response (no visible content). Reasoning: {reasoning_preview}")
                         else:
-                            self._vprint(f"{self.log_prefix}ℹ️  Empty response (no content or reasoning).")
+                            self._vprint(f"{self.log_prefix}ℹ️  Empty response (no content or reasoning) after 3 retries.")
 
                         final_response = "(empty)"
                         break

@@ -311,6 +311,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-bluebubbles": {
+        "description": "BlueBubbles iMessage bot toolset - Apple iMessage via local BlueBubbles server",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-homeassistant": {
         "description": "Home Assistant bot toolset - smart home event monitoring and control",
         "tools": _HERMES_CORE_TOOLS,
