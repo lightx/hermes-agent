@@ -62,7 +62,7 @@ YAML
         '';
 
         # Gateway systemd service
-        systemd.user.services.hermes-agent-gateway = lib.mkIf cfg.gateway.enable {
+        systemd.user.services.hermes-gateway = lib.mkIf cfg.gateway.enable {
           Unit = {
             Description = "Hermes Agent messaging gateway";
             After = [ "network-online.target" ];
