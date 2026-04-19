@@ -165,7 +165,8 @@ def setup_logging(
     """Configure the Hermes logging subsystem.
 
     Safe to call multiple times — the second call is a no-op unless
-    *force* is ``True``.
+    *force* is ``True`` or *mode* is ``"gateway"`` and the gateway.log
+    handler hasn't been added yet.
 
     Parameters
     ----------
@@ -195,11 +196,35 @@ def setup_logging(
         The ``logs/`` directory where files are written.
     """
     global _logging_initialized
-    if _logging_initialized and not force:
-        home = hermes_home or get_hermes_home()
-        return home / "logs"
-
     home = hermes_home or get_hermes_home()
+    
+    # Special case: if already initialized and mode="gateway", just add the
+    # gateway.log handler if it's missing. This allows AIAgent.__init__ to
+    # call setup_logging() without mode, and the gateway to later add its
+    # component-specific handler.
+    if _logging_initialized and not force:
+        if mode == "gateway":
+            log_dir = home / "logs"
+            root = logging.getLogger()
+            gateway_path = log_dir / "gateway.log"
+            # Check if gateway.log handler already exists
+            for h in root.handlers:
+                if isinstance(h, RotatingFileHandler):
+                    if Path(getattr(h, "baseFilename", "")).resolve() == gateway_path.resolve():
+                        return log_dir  # Already have gateway.log handler
+            # Add gateway.log handler (idempotency handled by _add_rotating_handler)
+            from agent.redact import RedactingFormatter
+            _add_rotating_handler(
+                root,
+                gateway_path,
+                level=logging.INFO,
+                max_bytes=5 * 1024 * 1024,
+                backup_count=3,
+                formatter=RedactingFormatter(_LOG_FORMAT),
+                log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
+            )
+            return log_dir
+        return home / "logs"
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
