@@ -1306,31 +1306,6 @@ class AIAgent:
             try:
                 _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
-                # Auto-migrate: if Honcho was actively configured (enabled +
-                # credentials) but memory.provider is not set, activate the
-                # honcho plugin automatically.  Just having the config file
-                # is not enough — the user may have disabled Honcho or the
-                # file may be from a different tool.
-                if not _mem_provider_name:
-                    try:
-                        from plugins.memory.honcho.client import HonchoClientConfig as _HCC
-                        _hcfg = _HCC.from_global_config()
-                        if _hcfg.enabled and (_hcfg.api_key or _hcfg.base_url):
-                            _mem_provider_name = "honcho"
-                            # Persist so this only auto-migrates once
-                            try:
-                                from hermes_cli.config import load_config as _lc, save_config as _sc
-                                _cfg = _lc()
-                                _cfg.setdefault("memory", {})["provider"] = "honcho"
-                                _sc(_cfg)
-                            except Exception:
-                                pass
-                            if not self.quiet_mode:
-                                print("  ✓ Auto-migrated Honcho to memory provider plugin.")
-                                print("    Your config and data are preserved.\n")
-                    except Exception:
-                        pass
-
                 if _mem_provider_name:
                     from agent.memory_manager import MemoryManager as _MemoryManager
                     from plugins.memory import load_memory_provider as _load_mem
@@ -1941,13 +1916,16 @@ class AIAgent:
     def _should_emit_quiet_tool_messages(self) -> bool:
         """Return True when quiet-mode tool summaries should print directly.
 
-        When the caller provides ``tool_progress_callback`` (for example the CLI
-        TUI or a gateway progress renderer), that callback owns progress display.
-        Emitting quiet-mode summary lines here duplicates progress and leaks tool
-        previews into flows that are expected to stay silent, such as
-        ``hermes chat -q``.
+        Quiet mode is used by both the interactive CLI and embedded/library
+        callers. The CLI may still want compact progress hints when no callback
+        owns rendering. Embedded/library callers, on the other hand, expect
+        quiet mode to be truly silent.
         """
-        return self.quiet_mode and not self.tool_progress_callback
+        return (
+            self.quiet_mode
+            and not self.tool_progress_callback
+            and getattr(self, "platform", "") == "cli"
+        )
 
     def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
@@ -2172,17 +2150,49 @@ class AIAgent:
         return bool(cleaned.strip())
     
     def _strip_think_blocks(self, content: str) -> str:
-        """Remove reasoning/thinking blocks from content, returning only visible text."""
+        """Remove reasoning/thinking blocks from content, returning only visible text.
+
+        Handles four cases:
+          1. Closed tag pairs (``<think>…</think>``) — the common path when
+             the provider emits complete reasoning blocks.
+          2. Unterminated open tag at a block boundary (start of text or
+             after a newline) — e.g. MiniMax M2.7 / NIM endpoints where the
+             closing tag is dropped.  Everything from the open tag to end
+             of string is stripped.  The block-boundary check mirrors
+             ``gateway/stream_consumer.py``'s filter so models that mention
+             ``<think>`` in prose aren't over-stripped.
+          3. Stray orphan open/close tags that slip through.
+          4. Tag variants: ``<think>``, ``<thinking>``, ``<reasoning>``,
+             ``<REASONING_SCRATCHPAD>``, ``<thought>`` (Gemma 4), all
+             case-insensitive.
+        """
         if not content:
             return ""
-        # Strip all reasoning tag variants: <think>, <thinking>, <THINKING>,
-        # <reasoning>, <REASONING_SCRATCHPAD>, <thought> (Gemma 4)
-        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+        # 1. Closed tag pairs — case-insensitive for all variants so
+        #    mixed-case tags (<THINK>, <Thinking>) don't slip through to
+        #    the unterminated-tag pass and take trailing content with them.
+        content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<thinking>.*?</thinking>', '', content, flags=re.DOTALL | re.IGNORECASE)
-        content = re.sub(r'<reasoning>.*?</reasoning>', '', content, flags=re.DOTALL)
-        content = re.sub(r'<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>', '', content, flags=re.DOTALL)
+        content = re.sub(r'<reasoning>.*?</reasoning>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r'<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE)
-        content = re.sub(r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*', '', content, flags=re.IGNORECASE)
+        # 2. Unterminated reasoning block — open tag at a block boundary
+        #    (start of text, or after a newline) with no matching close.
+        #    Strip from the tag to end of string.  Fixes #8878 / #9568
+        #    (MiniMax M2.7 leaking raw reasoning into assistant content).
+        content = re.sub(
+            r'(?:^|\n)[ \t]*<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)\b[^>]*>.*$',
+            '',
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        # 3. Stray orphan open/close tags that slipped through.
+        content = re.sub(
+            r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
+            '',
+            content,
+            flags=re.IGNORECASE,
+        )
         return content
 
     @staticmethod
@@ -7262,6 +7272,20 @@ class AIAgent:
         if reasoning_text:
             reasoning_text = _sanitize_surrogates(reasoning_text)
 
+        # Strip inline reasoning tags (<think>…</think> etc.) from the stored
+        # assistant content.  Reasoning was already captured into
+        # ``reasoning_text`` above (either from structured fields or the
+        # inline-block fallback), so the raw tags in content are redundant.
+        # Leaving them in place caused reasoning to leak to messaging
+        # platforms (#8878, #9568), inflate context on subsequent turns
+        # (#9306 observed 16% content-size reduction on a real MiniMax
+        # session), and pollute generated session titles.  One strip at the
+        # storage boundary cleans content for every downstream consumer:
+        # API replay, session transcript, gateway delivery, CLI display,
+        # compression, title generation.
+        if isinstance(_san_content, str) and _san_content:
+            _san_content = self._strip_think_blocks(_san_content).strip()
+
         msg = {
             "role": "assistant",
             "content": _san_content,
@@ -8301,7 +8325,7 @@ class AIAgent:
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
                 # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
                 spinner = None
-                if self.quiet_mode and not self.tool_progress_callback:
+                if self._should_emit_quiet_tool_messages():
                     face = random.choice(KawaiiSpinner.get_waiting_faces())
                     emoji = _get_tool_emoji(function_name)
                     preview = _build_tool_preview(function_name, function_args) or function_name
@@ -8319,7 +8343,7 @@ class AIAgent:
                     cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_ce_result)
                     if spinner:
                         spinner.stop(cute_msg)
-                    elif self.quiet_mode:
+                    elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
             elif self._memory_manager and self._memory_manager.has_tool(function_name):
                 # Memory provider tools (hindsight_retain, honcho_search, etc.)
@@ -10151,7 +10175,7 @@ class AIAgent:
                         _dhh = _dhh_fn()
                         print(f"{self.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
                         print(f"{self.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
-                        print(f"{self.log_prefix}     • For API keys: verify at https://console.anthropic.com/settings/keys")
+                        print(f"{self.log_prefix}     • For API keys: verify at https://platform.claude.com/settings/keys")
                         print(f"{self.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
                         print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
                         print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
@@ -11163,17 +11187,10 @@ class AIAgent:
                         self._last_content_tools_all_housekeeping = _all_housekeeping
                         if _all_housekeeping and self._has_stream_consumers():
                             self._mute_post_response = True
-                        elif self.quiet_mode:
+                        elif self._should_emit_quiet_tool_messages():
                             clean = self._strip_think_blocks(turn_content).strip()
                             if clean:
-                                relayed = False
-                                if (
-                                    self.tool_progress_callback
-                                    and getattr(self, "platform", "") == "tui"
-                                ):
-                                    relayed = True
-                                if not relayed:
-                                    self._vprint(f"  ┊ 💬 {clean}")
+                                self._vprint(f"  ┊ 💬 {clean}")
                     
                     # Pop thinking-only prefill message(s) before appending
                     # (tool-call path — same rationale as the final-response path).
