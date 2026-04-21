@@ -51,7 +51,7 @@ try:
 except ImportError:
     from acp.schema import AuthMethod as AuthMethodAgent  # type: ignore[attr-defined]
 
-from acp_adapter.auth import detect_provider, has_provider
+from acp_adapter.auth import detect_provider
 from acp_adapter.events import (
     make_message_cb,
     make_step_cb,
@@ -70,6 +70,11 @@ except Exception:
 
 # Thread pool for running AIAgent (synchronous) in parallel.
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
+
+# Server-side page size for list_sessions. The ACP ListSessionsRequest schema
+# does not expose a client-side limit, so this is a fixed cap that clients
+# paginate against using `cursor` / `next_cursor`.
+_LIST_SESSIONS_PAGE_SIZE = 50
 
 
 def _extract_text(
@@ -351,9 +356,18 @@ class HermesACPAgent(acp.Agent):
         )
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
-        if has_provider():
-            return AuthenticateResponse()
-        return None
+        # Only accept authenticate() calls whose method_id matches the
+        # provider we advertised in initialize(). Without this check,
+        # authenticate() would acknowledge any method_id as long as the
+        # server has provider credentials configured — harmless under
+        # Hermes' threat model (ACP is stdio-only, local-trust), but poor
+        # API hygiene and confusing if ACP ever grows multi-method auth.
+        provider = detect_provider()
+        if not provider:
+            return None
+        if not isinstance(method_id, str) or method_id.strip().lower() != provider:
+            return None
+        return AuthenticateResponse()
 
     # ---- Session management -------------------------------------------------
 
@@ -437,7 +451,28 @@ class HermesACPAgent(acp.Agent):
         cwd: str | None = None,
         **kwargs: Any,
     ) -> ListSessionsResponse:
+        """List ACP sessions with optional ``cwd`` filtering and cursor pagination.
+
+        ``cwd`` is passed through to ``SessionManager.list_sessions`` which already
+        normalizes and filters by working directory. ``cursor`` is a ``session_id``
+        previously returned as ``next_cursor``; results resume after that entry.
+        Server-side page size is capped at ``_LIST_SESSIONS_PAGE_SIZE``; when more
+        results remain, ``next_cursor`` is set to the last returned ``session_id``.
+        """
         infos = self.session_manager.list_sessions(cwd=cwd)
+
+        if cursor:
+            for idx, s in enumerate(infos):
+                if s["session_id"] == cursor:
+                    infos = infos[idx + 1:]
+                    break
+            else:
+                # Unknown cursor -> empty page (do not fall back to full list).
+                infos = []
+
+        has_more = len(infos) > _LIST_SESSIONS_PAGE_SIZE
+        infos = infos[:_LIST_SESSIONS_PAGE_SIZE]
+
         sessions = []
         for s in infos:
             updated_at = s.get("updated_at")
@@ -451,7 +486,9 @@ class HermesACPAgent(acp.Agent):
                     updated_at=updated_at,
                 )
             )
-        return ListSessionsResponse(sessions=sessions)
+
+        next_cursor = sessions[-1].session_id if has_more and sessions else None
+        return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
 
     # ---- Prompt (core) ------------------------------------------------------
 
@@ -613,8 +650,8 @@ class HermesACPAgent(acp.Agent):
             await self._conn.session_update(
                 session_id=session_id,
                 update=AvailableCommandsUpdate(
-                    sessionUpdate="available_commands_update",
-                    availableCommands=self._available_commands(),
+                    session_update="available_commands_update",
+                    available_commands=self._available_commands(),
                 ),
             )
         except Exception:

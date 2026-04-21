@@ -71,6 +71,7 @@ VALID_HOOKS: Set[str] = {
     "on_platform_adapter",
     "on_session_finalize",
     "on_session_reset",
+    "subagent_stop",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
