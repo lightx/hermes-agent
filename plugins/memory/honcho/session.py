@@ -278,8 +278,12 @@ class HonchoSessionManager:
             return self._cache[key]
 
         # Gateway sessions should use the runtime user identity when available.
+        # If the runtime identity is a raw platform ID (e.g. Telegram user ID),
+        # check userPeerMap for a canonical peer name override first.
         if self._runtime_user_peer_name:
-            user_peer_id = self._sanitize_id(self._runtime_user_peer_name)
+            peer_map = (self._config.user_peer_map if self._config else {}) or {}
+            mapped = peer_map.get(self._runtime_user_peer_name)
+            user_peer_id = self._sanitize_id(mapped if mapped else self._runtime_user_peer_name)
         elif self._config and self._config.peer_name:
             user_peer_id = self._sanitize_id(self._config.peer_name)
         else:

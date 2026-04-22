@@ -282,6 +282,10 @@ class HonchoClientConfig:
     session_strategy: str = "per-directory"
     session_peer_prefix: bool = False
     sessions: dict[str, str] = field(default_factory=dict)
+    # Maps platform user IDs (e.g. Telegram numeric IDs) to canonical peer names.
+    # Prevents gateway-supplied user IDs from fragmenting memory across multiple peers.
+    # Example: {"479667442": "Benoit"}
+    user_peer_map: dict[str, str] = field(default_factory=dict)
     # Raw global config for anything else consumers need
     raw: dict[str, Any] = field(default_factory=dict)
     # True when Honcho was explicitly configured for this host (hosts.hermes
@@ -502,6 +506,7 @@ class HonchoClientConfig:
             session_strategy=session_strategy,
             session_peer_prefix=session_peer_prefix,
             sessions=raw.get("sessions", {}),
+            user_peer_map=raw.get("userPeerMap", {}),
             raw=raw,
             explicitly_configured=_explicitly_configured,
         )

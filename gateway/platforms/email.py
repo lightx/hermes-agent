@@ -341,6 +341,8 @@ class EmailAdapter(BasePlatformAdapter):
         results = []
         try:
             imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            # Set socket timeout for all operations (connect timeout is 30s, ops get 60s)
+            imap.socket().settimeout(60)
             try:
                 imap.login(self._address, self._password)
                 imap.select("INBOX")

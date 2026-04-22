@@ -26,12 +26,6 @@
           description = "Path to environment file containing API keys.";
         };
 
-        messagingCwd = lib.mkOption {
-          type = lib.types.str;
-          default = config.home.homeDirectory;
-          description = "Working directory for gateway messaging.";
-        };
-
         gateway = {
           enable = lib.mkEnableOption "Hermes Agent messaging gateway";
         };
@@ -79,7 +73,6 @@ YAML
             Environment = [
               "HOME=${config.home.homeDirectory}"
               "HERMES_HOME=${cfg.hermesHome}"
-              "MESSAGING_CWD=${cfg.messagingCwd}"
             ];
             EnvironmentFile = cfg.environmentFile;
           };
