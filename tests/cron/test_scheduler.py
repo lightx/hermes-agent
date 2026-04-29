@@ -129,6 +129,22 @@ class TestResolveDeliveryTarget:
             "thread_id": "17",
         }
 
+    def test_explicit_telegram_topic_thread_survives_bare_directory_match(self):
+        """Exact channel-directory matches must not erase an explicit topic id."""
+        job = {
+            "deliver": "telegram:-1003724596514:17",
+        }
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="-1003724596514",
+        ):
+            result = _resolve_delivery_target(job)
+        assert result == {
+            "platform": "telegram",
+            "chat_id": "-1003724596514",
+            "thread_id": "17",
+        }
+
     def test_explicit_telegram_chat_id_without_thread_id(self):
         """deliver: 'telegram:chat_id' sets thread_id to None."""
         job = {
@@ -262,6 +278,44 @@ class TestResolveDeliveryTarget:
             "chat_id": "1001234567890",
             "thread_id": None,
         }
+
+    def test_list_form_deliver_is_normalized(self, monkeypatch):
+        """deliver=['telegram'] (Python list) should resolve like 'telegram' string.
+
+        Regression test for #17139: MCP clients / scripts that pass the deliver
+        field as an array-shaped value used to fail with "no delivery target
+        resolved for deliver=['telegram']" because ``str(['telegram'])`` was
+        passed through to ``split(',')`` verbatim.
+        """
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-4004")
+        job = {
+            "deliver": ["telegram"],
+            "origin": None,
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "telegram",
+            "chat_id": "-4004",
+            "thread_id": None,
+        }
+
+    def test_list_form_multiple_platforms_normalized(self, monkeypatch):
+        """deliver=['telegram', 'discord'] resolves to multiple targets."""
+        from cron.scheduler import _resolve_delivery_targets
+
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
+        monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
+        job = {"deliver": ["telegram", "discord"], "origin": None}
+
+        targets = _resolve_delivery_targets(job)
+        platforms = sorted(t["platform"] for t in targets)
+        assert platforms == ["discord", "telegram"]
+
+    def test_empty_list_form_deliver_resolves_to_local(self):
+        """deliver=[] is treated as local (no delivery)."""
+        from cron.scheduler import _resolve_delivery_targets
+
+        assert _resolve_delivery_targets({"deliver": []}) == []
 
 
 class TestDeliverResultWrapping:
